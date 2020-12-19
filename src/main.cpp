@@ -2,42 +2,44 @@
 #include <FirebaseESP32.h>
 #include <M5Stack.h>
 #include "RCS620S.h"
+#include <time.h>
 
 // WiFi, Firebaseの設定情報
-#define FIREBASE_HOST "esp32-felica.firebaseio.com"
-#define FIREBASE_AUTH "7AX6iO611QD6pHNiqvPnjkdOEPEYQsmVVPkiagyd"
-#define WIFI_SSID "kishimako_24_1"
-#define WIFI_PASSWORD "theshoreunder"
+#define FIREBASE_HOST "Your firebase host name"
+#define FIREBASE_AUTH "Your firebase auth key"
+#define WIFI_SSID "Your WiFi SSID name"
+#define WIFI_PASSWORD "Your WiFi Password"
 
 FirebaseData firebaseData;
+FirebaseJson json;
 
 // FeliCaの設定情報
 #define COMMAND_TIMEOUT 400
 #define POLLING_INTERVAL 500
 RCS620S rcs620s;
 
-bool statusA = true;
-bool statusB = true;
-bool statusC = true;
+// 時間の取得
+const char *ntpServer = "ntp.jst.mfeed.ad.jp";
+const long gmtOffset_sec = 9 * 3600;
+const int daylightOffset_sec = 0;
 
-bool buttonProcess(String buttonName, bool status)
+// フェーズの設定
+bool _registerPhase = false;
+
+// 時間をStringの形で取得
+String getTimeAsString()
 {
-  M5.Lcd.fillScreen(BLACK);
-  if (Firebase.setBool(firebaseData, "/" + buttonName + "/", status))
+  struct tm timeinfo;
+  String _timeNow = "";
+  if (!getLocalTime(&timeinfo))
   {
-    //Success
+    M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0);
-    M5.Lcd.print("Set bool data success");
+    M5.Lcd.print("Failed to obtain time");
+    return _timeNow;
   }
-  else
-  {
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("Error in setInt, ");
-    M5.Lcd.print(firebaseData.errorReason());
-  }
-  M5.Lcd.setCursor(0, 20);
-  M5.Lcd.print(buttonName + " was pressed!");
-  return status = !status;
+  _timeNow = String(1900 + timeinfo.tm_year) + "," + String(1 + timeinfo.tm_mon) + "," + String(timeinfo.tm_mday) + "," + String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min) + ":" + String(timeinfo.tm_sec);
+  return _timeNow;
 }
 
 void setup()
@@ -91,44 +93,79 @@ void setup()
   M5.Lcd.print("Felica reader is detected");
   delay(1000);
   M5.Lcd.fillScreen(BLACK);
+
+  //時間の初期化と取得
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 }
 
 void loop()
 {
-  M5.update();
-
-  int ret, i;
-  String felicaID = "";
+  int ret;
   rcs620s.timeout = COMMAND_TIMEOUT;
-  ret = rcs620s.polling();
-  if (ret)
-  {
-    for (i = 0; i < 8; i++)
-    {
-      if (rcs620s.idm[i] / 0x10 == 0)
-        felicaID += "0";
-      felicaID += String(rcs620s.idm[i], HEX);
-    }
-  }
-  if (!felicaID.isEmpty())
-  {
-    M5.Lcd.setCursor(0, 15);
-    M5.Lcd.print(felicaID);
-    delay(3000);
-    M5.Lcd.fillScreen(BLACK);
-  }
-
+  M5.update();
+  M5.Lcd.setTextColor(WHITE);
+  
+  // ボタンAを押すことで登録フェーズに入る
   if (M5.BtnA.wasPressed())
   {
-    statusA = buttonProcess("BtnA", statusA);
+    _registerPhase = true;
+    M5.Lcd.fillScreen(BLACK);
   }
-  if (M5.BtnB.wasPressed())
+  
+  // 通信待ち
+  ret = rcs620s.polling();
+  // 待機フェーズ
+  if (!_registerPhase)
   {
-    statusB = buttonProcess("BtnB", statusB);
+    M5.Lcd.setCursor(0, 0);
+    M5.Lcd.print("Press any key");
   }
-  if (M5.BtnC.wasPressed())
+  // 登録フェーズ
+  else
   {
-    statusC = buttonProcess("BtnC", statusC);
+    M5.Lcd.setCursor(0, 0);
+    M5.Lcd.print("Waiting for card...");
+    String felicaID = "";
+    if (ret)
+    {
+      for (int i = 0; i < 8; i++)
+      {
+        if (rcs620s.idm[i] / 0x10 == 0)
+          felicaID += "0";
+        felicaID += String(rcs620s.idm[i], HEX);
+      }
+    }
+    // FeliCaが置かれた場合は、Firebaseへ登録するためのjsonを作成する
+    if (!felicaID.isEmpty())
+    {
+      // "id"というフィールドにFeliCaのmIDを登録する
+      json.set("id", felicaID);
+      json.set("time", getTimeAsString());
+      // "User"というテーブルにユーザーの情報を登録していく
+      if (Firebase.pushJSON(firebaseData, "/User", json))
+      {
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setTextColor(YELLOW);
+        M5.Lcd.setCursor(0, 30);
+        M5.Lcd.print(felicaID);
+        M5.Lcd.setCursor(0, 60);
+        M5.Lcd.print("Your card is registered now!!");
+        delay(3000);
+      }
+      // Firebaseと通信できなければエラーを返す
+      else
+      {
+        M5.Lcd.setTextColor(RED);
+        M5.Lcd.setCursor(0, 30);
+        M5.Lcd.print("FAILED");
+        M5.Lcd.setCursor(0, 60);
+        M5.Lcd.print("REASON: " + firebaseData.errorReason());
+        delay(10000);
+      }
+      // 登録が終了したら待機フェーズに戻る
+      _registerPhase = false;
+      M5.Lcd.fillScreen(BLACK);
+    }
   }
   rcs620s.rfOff();
   delay(POLLING_INTERVAL);
